@@ -44,6 +44,14 @@ docker run --rm -p 8000:8000 hydraulics-api
 - `ELAGUJ1.csv` — `length_m,crest_m` (segments for spillway 1 in mode `CON_AGUJAS`)
 - `ELAGUJ2.csv` — `length_m,crest_m` (segments for spillway 2 in mode `CON_AGUJAS`)
 
+## PHP standalone script
+
+A lightweight PHP port of the simulation engine is available at `php/simulate.php`.
+Place this file on a PHP-enabled server and send a `POST` request with the same
+JSON payload accepted by the FastAPI `/simulate` endpoint. The script executes
+the hydraulic routing and persists the inputs, time series and summary metrics
+into the MySQL schema defined in this repository.
+
 ## Notes
 
 - Units: elevation in meters, volume in m³, flows in m³/s, time in hours.
