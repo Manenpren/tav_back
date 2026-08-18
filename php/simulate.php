@@ -1,53 +1,54 @@
 <?php
-header('Content-Type: application/json');
+declare(strict_types=1);
 
-// Database connection
-$db_host="localhost"; // Nombre del host
-$db_user="manserem_AdminCo"; // Usuario de la base de datos
-$db_pass=""; // Contraseña de usuario de base de datos
-$db_name="manserem_tav"; // Nombre de la base de datos
-$conn = new mysqli($db_host, $db_user, $db_pass, $db_name);
-if ($conn->connect_error) {
-    http_response_code(500);
-    echo json_encode(["error" => "Conexión falló: " . $conn->connect_error]);
+require_once __DIR__ . '/bootstrap.php';
+
+hydrodam_security_headers();
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'OPTIONS') {
+    http_response_code(204);
     exit;
 }
-
-if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
-    echo json_encode(["error" => "Método no soportado. Usa POST con JSON"]);
-    exit;
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+    hydrodam_json(['error' => ['code' => 'METHOD_NOT_ALLOWED', 'reason' => 'Usa POST con un cuerpo JSON.']], 405);
 }
 
+$session = hydrodam_require_session();
+$maxBodyBytes = max(1024, (int) (hydrodam_env('HYDRODAM_MAX_BODY_BYTES', '4194304') ?: '4194304'));
+$contentLength = (int) ($_SERVER['CONTENT_LENGTH'] ?? 0);
+if ($contentLength > $maxBodyBytes) {
+    hydrodam_json(['error' => ['code' => 'PAYLOAD_TOO_LARGE', 'reason' => 'El modelo excede el tamaño máximo permitido.']], 413);
+}
 $input = file_get_contents('php://input');
+if (!is_string($input) || $input === '' || strlen($input) > $maxBodyBytes) {
+    hydrodam_json(['error' => ['code' => 'INVALID_BODY', 'reason' => 'No se recibió un cuerpo JSON válido.']], 400);
+}
 $data = json_decode($input, true);
-if (!$data) {
-    http_response_code(400);
-    echo json_encode(["error" => "JSON inválido"]);
-    exit;
+if (!is_array($data)) {
+    hydrodam_json(['error' => ['code' => 'INVALID_JSON', 'reason' => 'El cuerpo de la solicitud no contiene JSON válido.']], 400);
 }
 
 try {
-    list($results, $summary) = simulate($data);
-} catch (Exception $e) {
-    http_response_code(422);
-    echo json_encode(["error" => $e->getMessage()]);
-    exit;
+    [$results, $summary] = simulate($data);
+} catch (Throwable $e) {
+    hydrodam_json(['error' => ['code' => 'SIMULATION_VALIDATION_ERROR', 'reason' => $e->getMessage()]], 422);
 }
 
-// ---- Store in DB ----
+$simulationId = null;
+$conn = null;
 try {
+    $conn = hydrodam_database();
     $conn->begin_transaction();
 
-    $description = isset($data['description']) ? "'".$conn->real_escape_string($data['description'])."'" : "NULL";
-    $gravity = floatval($data['gravity']);
-    $tolerance = floatval($data['tolerance']);
-    $max_iter_step = intval($data['max_iter_step']);
+    $description = isset($data['description']) ? "'".$conn->real_escape_string((string) $data['description'])."'" : "NULL";
+    $gravity = floatval($data['gravity'] ?? 9.81);
+    $tolerance = floatval($data['tolerance'] ?? 1e-5);
+    $max_iter_step = intval($data['max_iter_step'] ?? 1000);
     $dt_hours = $summary['dt_hours'];
     $velocity_head_enabled = !empty($data['velocity_head_enabled']) ? 1 : 0;
     $initial_level_m = isset($data['initial_level_m']) ? floatval($data['initial_level_m']) : "NULL";
     $initial_volume_m3 = isset($data['initial_volume_m3']) ? floatval($data['initial_volume_m3']) : "NULL";
     $drain_tail = !empty($data['drain_tail']) ? 1 : 0;
-    $tail_margin_m = floatval($data['tail_margin_m']);
+    $tail_margin_m = floatval($data['tail_margin_m'] ?? 0.02);
     $tail_hours_limit = isset($data['tail_hours_limit']) ? floatval($data['tail_hours_limit']) : "NULL";
 
     $max_level_m = $summary['max_level_m'];
@@ -62,72 +63,77 @@ try {
     $coeff2_at_peak = $summary['coeff2_at_peak'];
 
     $sql = "INSERT INTO simulations (description, gravity, tolerance, max_iter_step, dt_hours, velocity_head_enabled, initial_level_m, initial_volume_m3, drain_tail, tail_margin_m, tail_hours_limit, max_level_m, max_stored_hm3, peak_inflow_m3s, t_peak_inflow_h, peak_outflow_m3s, t_peak_outflow_h, peak_q1_m3s, peak_q2_m3s, coeff1_at_peak, coeff2_at_peak) VALUES ($description,$gravity,$tolerance,$max_iter_step,$dt_hours,$velocity_head_enabled,$initial_level_m,$initial_volume_m3,$drain_tail,$tail_margin_m,$tail_hours_limit,$max_level_m,$max_stored_hm3,$peak_inflow_m3s,$t_peak_inflow_h,$peak_outflow_m3s,$t_peak_outflow_h,$peak_q1_m3s,$peak_q2_m3s,$coeff1_at_peak,$coeff2_at_peak)";
-    if (!$conn->query($sql)) throw new Exception($conn->error);
-    $simulation_id = $conn->insert_id;
+    $conn->query($sql);
+    $simulationId = $conn->insert_id;
 
-    // ELCAP
-    if (isset($data['elev_volume'])) {
+    if (isset($data['elev_volume']) && is_array($data['elev_volume'])) {
         foreach ($data['elev_volume'] as $pt) {
-            $e = floatval($pt['elevation_m']);
-            $v = floatval($pt['volume_m3']);
-            $conn->query("INSERT INTO simulation_elcap (simulation_id, elevation_m, volume_m3) VALUES ($simulation_id,$e,$v)");
+            $e = floatval($pt['elevation_m'] ?? 0);
+            $v = floatval($pt['volume_m3'] ?? 0);
+            $conn->query("INSERT INTO simulation_elcap (simulation_id, elevation_m, volume_m3) VALUES ($simulationId,$e,$v)");
         }
     }
-
-    // INFLOW
-    if (isset($data['inflow'])) {
+    if (isset($data['inflow']) && is_array($data['inflow'])) {
         foreach ($data['inflow'] as $pt) {
-            $t = floatval($pt['t_hours']);
-            $q = floatval($pt['q_m3s']);
-            $conn->query("INSERT INTO simulation_inflow (simulation_id, t_hours, q_m3s) VALUES ($simulation_id,$t,$q)");
+            $t = floatval($pt['t_hours'] ?? 0);
+            $q = floatval($pt['q_m3s'] ?? 0);
+            $conn->query("INSERT INTO simulation_inflow (simulation_id, t_hours, q_m3s) VALUES ($simulationId,$t,$q)");
         }
     }
-
-    // Spillways
     for ($sp=1; $sp<=2; $sp++) {
-        $spkey = $sp==1 ? 'spillway1' : 'spillway2';
-        if (!isset($data[$spkey])) continue;
+        $spkey = $sp === 1 ? 'spillway1' : 'spillway2';
+        if (!isset($data[$spkey]) || !is_array($data[$spkey])) continue;
         $cfg = $data[$spkey];
-        $number = $sp;
-        $mode = $conn->real_escape_string($cfg['mode']);
-        $crest = floatval($cfg['crest_m']);
-        $design_head = floatval($cfg['design_head_m']);
-        $length = floatval($cfg['length_m']);
-        $approach = floatval($cfg['approach_depth_m']);
+        $mode = $conn->real_escape_string((string) ($cfg['mode'] ?? 'LIBRE'));
+        $crest = floatval($cfg['crest_m'] ?? 0);
+        $design_head = floatval($cfg['design_head_m'] ?? 0);
+        $length = floatval($cfg['length_m'] ?? 0);
+        $approach = floatval($cfg['approach_depth_m'] ?? 0);
         $discharge_coefficient = isset($cfg['discharge_coefficient']) ? floatval($cfg['discharge_coefficient']) : "NULL";
         $auto_coefficient = !empty($cfg['auto_coefficient']) ? 1 : 0;
         $slope_correction_enabled = !empty($cfg['slope_correction_enabled']) ? 1 : 0;
-        $slope_variant = intval($cfg['slope_variant']);
+        $slope_variant = intval($cfg['slope_variant'] ?? 1);
         $els_enabled = !empty($cfg['els_enabled']) ? 1 : 0;
-        $conn->query("INSERT INTO simulation_spillways (simulation_id, number, mode, crest_m, design_head_m, length_m, approach_depth_m, discharge_coefficient, auto_coefficient, slope_correction_enabled, slope_variant, els_enabled) VALUES ($simulation_id,$number,'$mode',$crest,$design_head,$length,$approach,$discharge_coefficient,$auto_coefficient,$slope_correction_enabled,$slope_variant,$els_enabled)");
+        $conn->query("INSERT INTO simulation_spillways (simulation_id, number, mode, crest_m, design_head_m, length_m, approach_depth_m, discharge_coefficient, auto_coefficient, slope_correction_enabled, slope_variant, els_enabled) VALUES ($simulationId,$sp,'$mode',$crest,$design_head,$length,$approach,$discharge_coefficient,$auto_coefficient,$slope_correction_enabled,$slope_variant,$els_enabled)");
     }
-
-    // Steps
     foreach ($results as $step) {
-        $t = $step['t_hours'];
-        $inflow = $step['inflow_m3s'];
-        $level = $step['level_m'];
-        $volume = $step['volume_m3'];
-        $q1 = $step['q1_m3s'];
-        $q2 = $step['q2_m3s'];
-        $q_intake = $step['q_intake_m3s'];
-        $q_total = $step['q_total_m3s'];
-        $c1 = $step['coeff1'];
-        $c2 = $step['coeff2'];
-        $vh1 = $step['vel_head1'];
-        $vh2 = $step['vel_head2'];
-        $conn->query("INSERT INTO simulation_steps (simulation_id, t_hours, inflow_m3s, level_m, volume_m3, q1_m3s, q2_m3s, q_intake_m3s, q_total_m3s, coeff1, coeff2, vel_head1, vel_head2) VALUES ($simulation_id,$t,$inflow,$level,$volume,$q1,$q2,$q_intake,$q_total,$c1,$c2,$vh1,$vh2)");
+        $t = floatval($step['t_hours']);
+        $inflow = floatval($step['inflow_m3s']);
+        $level = floatval($step['level_m']);
+        $volume = floatval($step['volume_m3']);
+        $q1 = floatval($step['q1_m3s']);
+        $q2 = floatval($step['q2_m3s']);
+        $q_intake = floatval($step['q_intake_m3s']);
+        $q_total = floatval($step['q_total_m3s']);
+        $c1 = floatval($step['coeff1']);
+        $c2 = floatval($step['coeff2']);
+        $vh1 = floatval($step['vel_head1']);
+        $vh2 = floatval($step['vel_head2']);
+        $conn->query("INSERT INTO simulation_steps (simulation_id, t_hours, inflow_m3s, level_m, volume_m3, q1_m3s, q2_m3s, q_intake_m3s, q_total_m3s, coeff1, coeff2, vel_head1, vel_head2) VALUES ($simulationId,$t,$inflow,$level,$volume,$q1,$q2,$q_intake,$q_total,$c1,$c2,$vh1,$vh2)");
     }
-
     $conn->commit();
-} catch (Exception $e) {
-    $conn->rollback();
-    http_response_code(500);
-    echo json_encode(["error" => $e->getMessage()]);
-    exit;
+} catch (Throwable $e) {
+    if ($conn instanceof mysqli) {
+        try { $conn->rollback(); } catch (Throwable $ignored) {}
+    }
+    $debug = hydrodam_bool('HYDRODAM_DEBUG', false);
+    hydrodam_json([
+        'error' => [
+            'code' => 'SIMULATION_PERSISTENCE_ERROR',
+            'reason' => $debug ? $e->getMessage() : 'El cálculo terminó, pero no fue posible registrar la corrida. Revise la configuración del backend.',
+        ],
+    ], 500);
 }
 
-echo json_encode(["summary" => $summary, "timeseries" => $results]);
+hydrodam_json([
+    'summary' => $summary,
+    'timeseries' => $results,
+    'meta' => [
+        'simulation_id' => $simulationId,
+        'user_id' => $session['user_id'] ?? null,
+        'client_id' => $session['client_id'] ?? null,
+    ],
+]);
 
 // ---------------- Simulation Functions ----------------
 function interp_y_from_x($xs, $ys, $x) {
@@ -426,3 +432,4 @@ function simulate($req) {
 
     return [$results, $summary];
 }
+

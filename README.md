@@ -1,61 +1,44 @@
+# TechyNest HydroDam — motor de tránsito y endpoint PHP
 
-# Hydraulics API (Reservoir Routing & Spillway Discharge)
+Backend del cálculo de tránsito de avenidas en vasos con uno o dos vertedores y obra de toma.
 
-FastAPI microservice that reproduces the logic from a legacy VB module to compute
-reservoir routing (level–storage curve) with one or two spillways (free, with needles, or controlled)
-plus an intake/outlet (obra de toma).
+## Motor
 
-## Run locally
+El repositorio conserva dos implementaciones:
+
+- API FastAPI para desarrollo/pruebas del motor.
+- `php/simulate.php` para el despliegue real en hosting PHP compartido.
+
+La formalización 1.1.0 no modifica las funciones de cálculo del port PHP; añade únicamente acceso, CSRF, configuración y endurecimiento alrededor del motor.
+
+## PHP de producción
+
+Copie `.env.example` como `.env` fuera de `public_html` y configure las variables `HYDRODAM_DB_*`. Por defecto el endpoint:
+
+1. exige cookie `hydro_session`;
+2. valida la sesión contra `https://hidro.manserempr.com.mx/api/auth/me`;
+3. compara `X-CSRF-Token` con el token de sesión;
+4. ejecuta el tránsito;
+5. persiste la corrida en la base existente.
+
+Consulte `docs/DEPLOY_SHARED_HOSTING.md` para la estructura pública/privada recomendada.
+
+## Pruebas del motor
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+python -m pytest -q
 ```
 
-## Run test 
-```bash
-python -m pytest -vv -rP
-```
+Resultado verificado para esta entrega: 18 pruebas aprobadas.
 
-Open docs at: http://localhost:8000/docs
+## Endpoints FastAPI de desarrollo
 
-## Docker
+- `POST /simulate`
+- `POST /simulate/files`
 
-```bash
-docker build -t hydraulics-api .
-docker run --rm -p 8000:8000 hydraulics-api
-```
+## Unidades
 
-## Endpoints
-
-- `POST /simulate` — JSON payload (see `app/schemas.py:SimulationRequest`)
-- `POST /simulate/files` — multipart upload of CSVs (ELCAP, INFLOW, optional LVC1/LVC2/ELS1/ELS2/TOMA/ELAGUJ1/ELAGUJ2)
-
-**CSV formats** (headers required):
-
-- `ELCAP.csv` — `elevation_m,volume_m3` (monotonic by volume)
-- `INFLOW.csv` — `t_hours,q_m3s` (monotonic time; constant dt recommended)
-- `LVC1.csv` — `elevation_m,q_m3s` (policy for spillway 1, if `CONTROLADO`)
-- `LVC2.csv` — `elevation_m,q_m3s` (policy for spillway 2, if `CONTROLADO`)
-- `ELS1.csv` — `elevation_m,factor` (launder/submergence factor for spillway 1)
-- `ELS2.csv` — `elevation_m,factor` (launder/submergence factor for spillway 2)
-- `TOMA.csv` — `q_m3s,elevation_m` (discharge vs water level for intake, used if `intake.mode="TABLE"`)
-- `ELAGUJ1.csv` — `length_m,crest_m` (segments for spillway 1 in mode `CON_AGUJAS`)
-- `ELAGUJ2.csv` — `length_m,crest_m` (segments for spillway 2 in mode `CON_AGUJAS`)
-
-## PHP standalone script
-
-A lightweight PHP port of the simulation engine is available at `php/simulate.php`.
-Place this file on a PHP-enabled server and send a `POST` request with the same
-JSON payload accepted by the FastAPI `/simulate` endpoint. The script executes
-the hydraulic routing and persists the inputs, time series and summary metrics
-into the MySQL schema defined in this repository.
-
-## Notes
-
-- Units: elevation in meters, volume in m³, flows in m³/s, time in hours.
-- The algorithm follows the legacy structure: linear interpolation on curves, weir equation `Q=C L H^(3/2)`, optional
-  velocity-head feedback, slope correction `CT`, needles summation, and trapezoidal storage routing.
-- Tolerances and safeguards are configurable in the JSON request.
-- The service returns time series and summary KPIs similar to the VB routine.
+- elevación: m;
+- almacenamiento: m³;
+- caudal: m³/s;
+- tiempo: h.
